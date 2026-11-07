@@ -3,3 +3,8 @@ __pycache__/
 .env
 .env.*
 .venv/
+data/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*

@@ -1,240 +1,189 @@
-"""CloudLink Lab: local, standard-library-only Bemfa TCP bridge.
-Credentials remain in this process's memory. Virtual devices live in index.html.
-"""
-import collections
+"""CloudLink Lab local application. Python 3.10+, standard library only."""
+import argparse
+import csv
+import io
 import json
-import re
-import socket
+import math
 import threading
-import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from engine import Lab
 
 ROOT = Path(__file__).resolve().parent
+STATIC_FILES = {
+    '/': ('index.html', 'text/html; charset=utf-8'),
+    '/index.html': ('index.html', 'text/html; charset=utf-8'),
+    '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
+    '/style.css': ('style.css', 'text/css; charset=utf-8'),
+    '/preview.html': ('preview.html', 'text/html; charset=utf-8'),
+}
 
 
-class Broker:
-    def __init__(self, uid, data, control):
-        self.uid, self.topics = uid, {"telemetry": data, "control": control}
-        self.sock = None
-        self.connected = False
-        self.ready = threading.Event()
-        self.stop = threading.Event()
-        self.lock = threading.Lock()
-        self.events = collections.deque(maxlen=1000)
-        self.queue_lock = threading.Lock()
-        self.error = "订阅未确认，请检查私钥和 TCP 主题"
-
-    def event(self, item):
-        with self.queue_lock:
-            self.events.append(item)
-
-    def drain(self):
-        with self.queue_lock:
-            items = list(self.events)
-            self.events.clear()
-        return items
-
-    def send(self, text):
-        with self.lock:
-            if not self.sock or self.stop.is_set():
-                raise ConnectionError("not connected")
-            self.sock.sendall((text + "\r\n").encode("utf-8"))
-
-    def open(self):
-        try:
-            self.sock = socket.create_connection(("bemfa.com", 8344), timeout=4)
-            self.sock.settimeout(1)
-            threading.Thread(target=self.receive, daemon=True).start()
-            self.send("cmd=1&uid=" + self.uid + "&topic=" + ",".join(self.topics.values()))
-            if not self.ready.wait(5) or not self.connected:
-                self.close()
-                return False
-            return True
-        except (OSError, ValueError):
-            self.error = "无法连接巴法云，请检查网络、账号和 TCP 主题"
-            self.close()
-            return False
-
-    def receive(self):
-        buffer = b""
-        last_ping = time.monotonic()
-        try:
-            while not self.stop.is_set():
-                if time.monotonic() - last_ping > 25:
-                    self.send("ping")
-                    last_ping = time.monotonic()
-                try:
-                    chunk = self.sock.recv(4096)
-                except socket.timeout:
-                    continue
-                if not chunk:
-                    raise ConnectionError("closed")
-                buffer += chunk
-                if len(buffer) > 65536:
-                    raise ValueError("frame too large")
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    self.handle(line.decode("utf-8", errors="replace").strip())
-        except (OSError, ValueError, AttributeError):
-            if not self.stop.is_set():
-                self.event({"type": "error", "message": "巴法云连接中断，请重新连接"})
-        finally:
-            self.connected = False
-            self.ready.set()
-
-    def handle(self, line):
-        # Do not log the raw frame: Bemfa may echo the account private key.
-        fields = dict(part.split("=", 1) for part in line.split("&") if "=" in part)
-        if fields.get("cmd") == "1" and "res" in fields:
-            self.connected = fields["res"] == "1"
-            self.ready.set()
-        if "msg" not in fields:
-            return
-        topic = fields.get("topic", "")
-        channel = next((k for k, v in self.topics.items() if v == topic), None)
-        if channel is None:
-            return
-        try:
-            payload = json.loads(fields["msg"])
-            if isinstance(payload, dict):
-                self.event({"type": "message", "channel": channel, "payload": payload})
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    def publish(self, channel, payload):
-        if not self.connected:
-            return False
-        message = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
-        if "&" in message or "\r" in message or "\n" in message or len(message) > 512:
-            return False
-        try:
-            self.send("cmd=2&uid=" + self.uid + "&topic=" + self.topics[channel] + "&msg=" + message)
-            return True
-        except (OSError, KeyError):
-            self.connected = False
-            return False
-
-    def close(self):
-        self.stop.set()
-        self.connected = False
-        sock, self.sock = self.sock, None
-        if sock:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            sock.close()
-        self.uid = ""
-
-
-broker = None
-broker_lock = threading.Lock()
+def query_options(query):
+    device = query.get('device', ['ENV-001'])[0]
+    try:
+        limit = int(query.get('limit', ['120'])[0])
+        after = float(query.get('after', ['0'])[0])
+    except (ValueError, OverflowError):
+        raise ValueError('历史筛选条件无效') from None
+    if not 1 <= limit <= 500 or not math.isfinite(after) or after < 0:
+        raise ValueError('历史筛选条件超出范围')
+    return device, limit, after
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def reply(self, data, code=200):
-        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    @property
+    def lab(self):
+        return self.server.lab
+
+    def send_bytes(self, raw, content_type, code=200, filename=None):
         self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(raw)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        if filename:
+            self.send_header('Content-Disposition', 'attachment; filename="' + filename + '"')
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def reply(self, data, code=200):
+        raw = json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        self.send_bytes(raw, 'application/json; charset=utf-8', code)
 
     def allowed(self):
-        # Bind only to loopback; reject foreign Host/Origin and cross-site requests.
-        host = self.headers.get("Host", "")
-        if host not in {"127.0.0.1:8765", "localhost:8765"}:
-            return False
-        origin = self.headers.get("Origin")
-        if origin and origin not in {"http://127.0.0.1:8765", "http://localhost:8765"}:
-            return False
-        return self.headers.get("Sec-Fetch-Site") != "cross-site"
+        port = self.server.server_port
+        allowed_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
+        allowed_origins = {'http://' + host for host in allowed_hosts}
+        origin = self.headers.get('Origin')
+        return (self.headers.get('Host') in allowed_hosts
+                and (not origin or origin in allowed_origins)
+                and self.headers.get('Sec-Fetch-Site') != 'cross-site')
 
     def do_GET(self):
         if not self.allowed():
-            self.reply({"error": "仅支持本机同源访问"}, 403)
+            self.reply({'error': '仅支持本机同源访问'}, 403)
             return
-        path = urlsplit(self.path).path
-        if path == "/api/health":
-            self.reply({"app": "cloudlink"})
-        elif path == "/api/events":
-            b = broker
-            self.reply({"connected": bool(b and b.connected), "events": b.drain() if b else []})
-        elif path in ("/", "/index.html"):
-            raw = (ROOT / "index.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(raw)
-        else:
-            self.reply({"error": "not found"}, 404)
+        request = urlsplit(self.path)
+        try:
+            if request.path == '/api/health':
+                self.reply({'app': 'cloudlink', 'version': '2.0.0'})
+            elif request.path == '/api/state':
+                device, limit, after = query_options(parse_qs(request.query))
+                self.reply(self.lab.snapshot(device, limit, after))
+            elif request.path == '/api/export':
+                self.export_csv(parse_qs(request.query))
+            elif request.path in STATIC_FILES:
+                filename, content_type = STATIC_FILES[request.path]
+                self.send_bytes((ROOT / filename).read_bytes(), content_type)
+            else:
+                self.reply({'error': '页面不存在'}, 404)
+        except ValueError as error:
+            self.reply({'error': str(error)}, 400)
+
+    def export_csv(self, query):
+        device, _, after = query_options(query)
+        if device not in self.lab.devices:
+            raise ValueError('设备不存在')
+        rows = self.lab.db.rows(
+            'SELECT device_id,received_at,temperature,humidity,fan,mode FROM telemetry '
+            'WHERE device_id=? AND received_at>=? ORDER BY sequence DESC LIMIT 100000', (device, after),
+        )
+        output = io.StringIO(newline='')
+        output.write('\ufeff')
+        writer = csv.writer(output)
+        writer.writerow(['device_id', 'received_at_unix', 'temperature_C', 'humidity_RH', 'fan', 'mode'])
+        for row in reversed(rows):
+            writer.writerow(row.values())
+        self.send_bytes(output.getvalue().encode('utf-8'), 'text/csv; charset=utf-8', filename=device + '.csv')
 
     def do_POST(self):
-        global broker
-        if not self.allowed() or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
-            self.reply({"error": "仅支持本机同源 JSON 请求"}, 403)
+        if not self.allowed() or self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
+            self.reply({'error': '仅支持本机同源 JSON 请求'}, 403)
             return
         try:
-            size = int(self.headers.get("Content-Length", "0"))
+            size = int(self.headers.get('Content-Length', '0'))
             if not 0 < size <= 4096:
-                raise ValueError()
+                raise ValueError('请求过大或为空')
             data = json.loads(self.rfile.read(size))
             if not isinstance(data, dict):
-                raise ValueError()
-        except (ValueError, json.JSONDecodeError):
-            self.reply({"error": "invalid request"}, 400)
-            return
-        path = urlsplit(self.path).path
-        if path == "/api/connect":
-            uid, topic_data, topic_control = (str(data.get(k, "")) for k in ("uid", "data", "control"))
-            if not re.fullmatch(r"[A-Za-z0-9]{8,128}", uid) or not all(re.fullmatch(r"[A-Za-z0-9_]{1,64}", t) for t in (topic_data, topic_control)) or topic_data == topic_control:
-                self.reply({"ok": False, "error": "私钥或主题格式不正确"})
-                return
-            with broker_lock:
-                if broker:
-                    broker.close()
-                broker = Broker(uid, topic_data, topic_control)
-                ok = broker.open()
-                self.reply({"ok": ok, "error": None if ok else broker.error})
-        elif path == "/api/publish":
-            channel, payload = data.get("channel"), data.get("payload")
-            if channel not in ("telemetry", "control") or not isinstance(payload, dict):
-                self.reply({"ok": False}, 400)
-                return
-            self.reply({"ok": bool(broker and broker.publish(channel, payload))})
-        elif path == "/api/disconnect":
-            with broker_lock:
-                if broker:
-                    broker.close()
-                    broker = None
-            self.reply({"ok": True})
+                raise ValueError('请求须为 JSON 对象')
+            self.mutate(urlsplit(self.path).path, data)
+        except (ValueError, TypeError, OverflowError):
+            self.reply({'error': '参数无效，请检查设备、模式、主题和私钥格式'}, 400)
+
+    def mutate(self, path, data):
+        if path == '/api/connect':
+            # Accept the original topic field names so saved connection instructions remain valid.
+            self.lab.configure_cloud(data.get('uid'), data.get('data'), data.get('control'))
+            self.reply({'ok': True, 'state': 'connecting'})
+        elif path == '/api/disconnect':
+            self.lab.change_transport()
+            self.reply({'ok': True})
+        elif path == '/api/device':
+            changes = data.get('changes')
+            if not isinstance(changes, dict) or not isinstance(data.get('device_id'), str):
+                raise ValueError('设备设置无效')
+            self.lab.configure_device(data['device_id'], changes)
+            self.reply({'ok': True})
+        elif path == '/api/command':
+            if not isinstance(data.get('device_id'), str) or not isinstance(data.get('action'), str):
+                raise ValueError('指令无效')
+            command = self.lab.issue_command(data['device_id'], data['action'], data.get('id'))
+            self.reply({'ok': True, 'command': command})
         else:
-            self.reply({"error": "not found"}, 404)
+            self.reply({'error': '接口不存在'}, 404)
 
 
-if __name__ == "__main__":
+def create_server(port=8765, database_path=None, start_devices=True):
+    lab = Lab(database_path or ROOT / 'data' / 'cloudlink.sqlite3')
     try:
-        httpd = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
+        server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     except OSError:
-        print("端口 8765 已被占用。请关闭先前的 CloudLink 程序后重试。")
-        raise SystemExit(1)
-    print("CloudLink Lab 已启动：http://127.0.0.1:8765")
-    print("浏览器未自动打开时，请复制上面的地址。按 Ctrl+C 退出。")
-    threading.Timer(0.7, lambda: webbrowser.open("http://127.0.0.1:8765")).start()
+        lab.close()
+        raise
+    server.daemon_threads = True
+    server.lab = lab
+    if start_devices:
+        lab.start()
+    return server
+
+
+def main():
+    parser = argparse.ArgumentParser(description='CloudLink Lab local application')
+    parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--no-browser', action='store_true')
+    parser.add_argument('--database', type=Path, help='SQLite file path')
+    args = parser.parse_args()
     try:
-        httpd.serve_forever()
+        server = create_server(args.port, args.database)
+    except OSError:
+        print('端口已被占用，请关闭旧版 CloudLink 窗口后重试。')
+        return 1
+    url = f'http://127.0.0.1:{server.server_port}'
+    print('CloudLink Lab 2.0 已启动 ' + url)
+    print('三个虚拟设备正在运行，关闭网页后仍可采样。按 Ctrl+C 退出程序。')
+    if not args.no_browser:
+        threading.Timer(0.7, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        if broker:
-            broker.close()
-        httpd.server_close()
+        server.shutdown()
+        server.server_close()
+        server.lab.close()
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
